@@ -58,6 +58,14 @@ BACKENDS: dict[str, dict] = {
         "pricing": {"input": 0.74, "output": 4.66},  # USD per 1M tokens
         "temperature": None,  # kimi-k2.6 enforces its own fixed temperature; sending any value raises 400
     },
+    "ollama": {
+        "base_url": "http://localhost:11434",
+        "default_model": "qwen3:8b",
+        # Env var only acts as opt-in marker; native /api/chat needs no auth.
+        "env_key": "GRAPHIFY_OLLAMA_KEY",
+        "pricing": {"input": 0.0, "output": 0.0},  # local, free
+        "temperature": 0,
+    },
 }
 
 _EXTRACTION_SYSTEM = """\
@@ -177,6 +185,44 @@ def _call_claude(api_key: str, model: str, user_message: str) -> dict:
     return result
 
 
+def _call_ollama_native(base_url: str, model: str, user_message: str) -> dict:
+    """Call Ollama's native /api/chat endpoint.
+
+    The OpenAI-compat shim (as of Ollama 0.18.3) cannot disable qwen3 reasoning
+    nor enforce JSON output, so we go straight to /api/chat which supports
+    `think: false` (skip reasoning) and `format: "json"` (constrained generation
+    that guarantees a parseable JSON object — eliminates most invalid-JSON
+    retries).
+    """
+    import urllib.request
+
+    body = json.dumps({
+        "model": model,
+        "messages": [
+            {"role": "system", "content": _EXTRACTION_SYSTEM},
+            {"role": "user", "content": user_message},
+        ],
+        "stream": False,
+        "think": False,
+        "format": "json",
+        "options": {"temperature": 0, "num_predict": 8192},
+    }).encode()
+    req = urllib.request.Request(
+        f"{base_url}/api/chat",
+        data=body,
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=600) as resp:
+        d = json.loads(resp.read())
+    result = _parse_llm_json(d["message"]["content"])
+    result["input_tokens"] = d.get("prompt_eval_count", 0)
+    result["output_tokens"] = d.get("eval_count", 0)
+    result["model"] = model
+    # Ollama's done_reason: "stop" | "length" | "load" — map to OpenAI vocab.
+    result["finish_reason"] = "length" if d.get("done_reason") == "length" else "stop"
+    return result
+
+
 def extract_files_direct(
     files: list[Path],
     backend: str = "kimi",
@@ -204,8 +250,9 @@ def extract_files_direct(
 
     if backend == "claude":
         return _call_claude(key, mdl, user_msg)
-    else:
-        return _call_openai_compat(cfg["base_url"], key, mdl, user_msg, temperature=cfg.get("temperature", 0))
+    if backend == "ollama":
+        return _call_ollama_native(cfg["base_url"], mdl, user_msg)
+    return _call_openai_compat(cfg["base_url"], key, mdl, user_msg, temperature=cfg.get("temperature", 0))
 
 
 def _estimate_file_tokens(path: Path) -> int:
