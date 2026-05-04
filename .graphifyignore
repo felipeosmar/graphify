@@ -1,0 +1,63 @@
+# ---- universal ----
+.git/
+.venv/
+venv/
+node_modules/
+dist/
+build/
+target/
+__pycache__/
+*.pyc
+.cache/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ---- saídas do próprio graphify (evita loop) ----
+graphify-out/
+graphify-out-*/
+
+# ---- lockfiles ----
+*.lock
+*.lockb
+package-lock.json
+yarn.lock
+poetry.lock
+uv.lock
+Cargo.lock
+go.sum
+
+# ---- repo-específico: graphify v6 ----
+# 27 traduções de README — custo enorme, valor zero p/ grafo
+docs/translations/
+
+# corpora de teste — só indexa se quiser estudar os exemplos
+worked/
+
+# fixtures multi-linguagem do tree-sitter — testes, não código de produção
+tests/fixtures/
+
+# CHANGELOG é histórico
+CHANGELOG.md
+
+# variantes da mesma skill por plataforma — manter só skill.md (canônica)
+graphify/skill-aider.md
+graphify/skill-claw.md
+graphify/skill-codex.md
+graphify/skill-copilot.md
+graphify/skill-droid.md
+graphify/skill-kiro.md
+graphify/skill-opencode.md
+graphify/skill-pi.md
+graphify/skill-trae.md
+graphify/skill-trae-cn.md
+graphify/skill-vscode.md
+graphify/skill-windows.md
+graphify/skill-hermes.md
+graphify/skill-gemini.md
+graphify/skill-cursor.md
+graphify/skill-antigravity.md
+
+# scratchpad local (não pertence ao upstream)
+local-extras/
+PLANO_LOCAL.md
