@@ -1,0 +1,47 @@
+# Template de .graphifyignore — copiar para a raiz do projeto que você for indexar.
+# Mesma sintaxe do .gitignore, com ! para negação.
+
+# ---- universal ----
+.git/
+.venv/
+venv/
+node_modules/
+dist/
+build/
+target/
+__pycache__/
+*.pyc
+.cache/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ---- saídas do próprio graphify ----
+# (não indexa o que ele mesmo gera — evita loop)
+graphify-out/
+graphify-out-*/
+
+# ---- artefatos pesados de doc que raramente agregam ----
+*.lock
+*.lockb
+package-lock.json
+yarn.lock
+poetry.lock
+uv.lock
+Cargo.lock
+go.sum
+
+# ---- específico para o repo do graphify v4 ----
+# 29 traduções de README — custo enorme, valor zero
+docs/translations/
+# corpora de teste — só indexa se você quer estudar os exemplos
+worked/
+# CHANGELOG é histórico, raramente útil pra grafo
+CHANGELOG.md
+
+# ---- mídia (descomente o que NÃO quiser indexar) ----
+# *.mp4
+# *.mov
+# *.png
+# *.jpg
+# *.pdf
