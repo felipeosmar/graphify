@@ -61,12 +61,19 @@ BACKENDS: dict[str, dict] = {
     "ollama": {
         "base_url": "http://localhost:11434",
         "default_model": "qwen3:8b",
+        # Separate model for image inputs (multimodal). Loaded on demand by
+        # Ollama; expect a 2-5s swap when alternating with the text model.
+        "vision_model": "llava:7b",
         # Env var only acts as opt-in marker; native /api/chat needs no auth.
         "env_key": "GRAPHIFY_OLLAMA_KEY",
         "pricing": {"input": 0.0, "output": 0.0},  # local, free
         "temperature": 0,
     },
 }
+
+# File extensions routed to the vision model (Ollama backend only). Used to
+# split mixed chunks so text and images each go to the right model.
+_IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"}
 
 _EXTRACTION_SYSTEM = """\
 You are a graphify semantic extraction agent. Extract a knowledge graph fragment from the files provided.
@@ -185,6 +192,54 @@ def _call_claude(api_key: str, model: str, user_message: str) -> dict:
     return result
 
 
+def _call_ollama_vision(base_url: str, image_path: Path, model: str, root: Path) -> dict:
+    """Call Ollama's /api/chat with an image attached (multimodal).
+
+    One call per image: the prompt is image-specific and base64 payloads are
+    too large to batch usefully. Caller is responsible for passing files
+    whose extension is in `_IMAGE_EXTS`.
+    """
+    import base64
+    import urllib.request
+
+    try:
+        rel = image_path.relative_to(root)
+    except ValueError:
+        rel = image_path
+    img_b64 = base64.b64encode(image_path.read_bytes()).decode()
+
+    user_text = (
+        f"=== {rel} ===\n"
+        "Extract a knowledge graph fragment describing the entities and relations "
+        "visible in this image. Use file_type=\"image\" for nodes derived from the "
+        f"image content. source_file should be \"{rel}\"."
+    )
+    body = json.dumps({
+        "model": model,
+        "messages": [
+            {"role": "system", "content": _EXTRACTION_SYSTEM},
+            {"role": "user", "content": user_text, "images": [img_b64]},
+        ],
+        "stream": False,
+        "think": False,
+        "format": "json",
+        "options": {"temperature": 0, "num_predict": 4096},
+    }).encode()
+    req = urllib.request.Request(
+        f"{base_url}/api/chat",
+        data=body,
+        headers={"Content-Type": "application/json"},
+    )
+    with urllib.request.urlopen(req, timeout=600) as resp:
+        d = json.loads(resp.read())
+    result = _parse_llm_json(d["message"]["content"])
+    result["input_tokens"] = d.get("prompt_eval_count", 0)
+    result["output_tokens"] = d.get("eval_count", 0)
+    result["model"] = model
+    result["finish_reason"] = "length" if d.get("done_reason") == "length" else "stop"
+    return result
+
+
 def _call_ollama_native(base_url: str, model: str, user_message: str) -> dict:
     """Call Ollama's native /api/chat endpoint.
 
@@ -251,7 +306,41 @@ def extract_files_direct(
     if backend == "claude":
         return _call_claude(key, mdl, user_msg)
     if backend == "ollama":
-        return _call_ollama_native(cfg["base_url"], mdl, user_msg)
+        # Split mixed chunks: text → text model, images → vision model. Text
+        # first so the text model stays loaded for as long as possible (Ollama
+        # swaps models in/out of VRAM on demand and only one fits at a time).
+        text_files = [f for f in files if f.suffix.lower() not in _IMAGE_EXTS]
+        image_files = [f for f in files if f.suffix.lower() in _IMAGE_EXTS]
+        if not image_files:
+            return _call_ollama_native(cfg["base_url"], mdl, user_msg)
+
+        merged: dict = {
+            "nodes": [], "edges": [], "hyperedges": [],
+            "input_tokens": 0, "output_tokens": 0,
+            "finish_reason": "stop",
+        }
+        if text_files:
+            text_msg = _read_files(text_files, root)
+            r = _call_ollama_native(cfg["base_url"], mdl, text_msg)
+            for k in ("nodes", "edges", "hyperedges"):
+                merged[k].extend(r.get(k, []))
+            merged["input_tokens"] += r.get("input_tokens", 0)
+            merged["output_tokens"] += r.get("output_tokens", 0)
+            if r.get("finish_reason") == "length":
+                merged["finish_reason"] = "length"
+
+        vision_model = cfg.get("vision_model", "llava:7b")
+        for img in image_files:
+            r = _call_ollama_vision(cfg["base_url"], img, vision_model, root)
+            for k in ("nodes", "edges", "hyperedges"):
+                merged[k].extend(r.get(k, []))
+            merged["input_tokens"] += r.get("input_tokens", 0)
+            merged["output_tokens"] += r.get("output_tokens", 0)
+            if r.get("finish_reason") == "length":
+                merged["finish_reason"] = "length"
+
+        merged["model"] = f"{mdl}+{vision_model}" if text_files else vision_model
+        return merged
     return _call_openai_compat(cfg["base_url"], key, mdl, user_msg, temperature=cfg.get("temperature", 0))
 
 
@@ -442,7 +531,21 @@ def extract_corpus_parallel(
     output_tokens. Failed chunks are logged to stderr and skipped — one bad
     chunk does not abort the run.
     """
-    if token_budget is not None:
+    if backend == "ollama":
+        # Ollama serializes per loaded model; concurrent requests just queue.
+        # Force sequential to keep ordering deterministic and avoid timeouts.
+        max_concurrency = 1
+        # Process text first, then images. Each image gets its own chunk so
+        # the vision-model swap happens once at the end of the run rather
+        # than thrashing in/out of VRAM on every text↔image alternation.
+        text_files = [f for f in files if f.suffix.lower() not in _IMAGE_EXTS]
+        image_files = [f for f in files if f.suffix.lower() in _IMAGE_EXTS]
+        if token_budget is not None:
+            chunks = _pack_chunks_by_tokens(text_files, token_budget=token_budget) if text_files else []
+        else:
+            chunks = [text_files[i:i + chunk_size] for i in range(0, len(text_files), chunk_size)] if text_files else []
+        chunks.extend([img] for img in image_files)
+    elif token_budget is not None:
         chunks = _pack_chunks_by_tokens(files, token_budget=token_budget)
     else:
         chunks = [files[i:i + chunk_size] for i in range(0, len(files), chunk_size)]
